@@ -50,37 +50,274 @@ const MONTH_NAMES = [
   'nov',
   'dec',
 ];
-// As in `new Date()`, the parts of a date may be separated by any run of
-// spaces, commas, dots, slashes and dashes ("2024 02 30", "02,30,2024",
-// "Feb.30.2024"), and a numeric date may follow a weekday ("Fri 02/30/2024").
-const NAMED_MONTH_DATE_PATTERNS = [
-  // "Feb 30, 2024", "Thu Feb 30 2024 10:00:00 GMT+0300", "Feb-30-2024",
-  // "Feb 30, 24", "Feb 30", "Thu Feb 30"
-  /^\s*(?:[a-z]+,?\s+)?(?<month>[a-z]{3,})\.?[\s,./-]+(?<day>\d{1,2})(?:(?:[\s,./-]+)(?<year>\d{4}|\d{2}(?!:))(?!\d)|(?![\s\S]*\d))/i,
-  // "30 Feb 2024", "Thu, 30 Feb 2024 10:00:00 GMT", "30-Feb-2024", "30-Feb-24",
-  // "30 Feb"
-  /^\s*(?:[a-z]+,?\s+)?(?<day>\d{1,2})[\s,./-]+(?<month>[a-z]{3,})\.?(?:(?:[\s,./-]+)(?<year>\d{4}|\d{2}(?!:))(?!\d)|(?![\s\S]*\d))/i,
-  // "2024 Feb 30", "2024-Feb-30"
-  /^\s*(?<year>\d{4})[\s,./-]+(?<month>[a-z]{3,})\.?[\s,./-]+(?<day>\d{1,2})(?!\d)/i,
-];
-// "2024-02-30", "2024 02 30", "Fri, 2024/02/30", "+002024-02-30"
-const YEAR_FIRST_DATE_PATTERN =
-  /^\s*(?:(?:sun|mon|tue|wed|thu|fri|sat)[a-z]*,?\s+)?([+-]\d{6}|\d{4})[\s,./-]+(\d{1,2})[\s,./-]+(\d{1,2})(?!\d)/i;
-// "02/30/2024", "02,30,2024", "Fri 02/30/2024", "2.30.24"
-const MONTH_FIRST_DATE_PATTERN =
-  /^\s*(?:(?:sun|mon|tue|wed|thu|fri|sat)[a-z]*,?\s+)?(\d{1,2})[\s,./-]+(\d{1,2})[\s,./-]+(\d{4}|\d{2}(?!:))(?!\d)/i;
+// The offset from UTC, in hours, of the time zones `new Date()` reads by name
+const TIME_ZONE_OFFSETS: Record<string, number> = {
+  ut: 0,
+  utc: 0,
+  z: 0,
+  gmt: 0,
+  cdt: -5,
+  cst: -6,
+  edt: -4,
+  est: -5,
+  mdt: -6,
+  mst: -7,
+  pdt: -7,
+  pst: -8,
+};
+
+type DateToken =
+  | { type: 'number'; value: number; length: number }
+  | { type: 'word'; value: string }
+  | { type: 'symbol'; value: string }
+  | { type: 'separator' };
+
+const isDigit = (char: string | undefined) =>
+  char !== undefined && char >= '0' && char <= '9';
+// A run of characters from "A" up is a word, up to white space other than
+// the line breaks U+2028 and U+2029, which V8's date parser reads in a word
+const isWordChar = (char: string | undefined) =>
+  char !== undefined &&
+  char >= 'A' &&
+  (!/\s/.test(char) ||
+    char.charCodeAt(0) === 0x2028 ||
+    char.charCodeAt(0) === 0x2029);
+const isSymbol = (
+  token: DateToken | undefined,
+  symbol: string,
+): token is { type: 'symbol'; value: string } =>
+  token?.type === 'symbol' && token.value === symbol;
+const isDay = (value: number) => value >= 1 && value <= 31;
 
 /**
- * Reads a year as `new Date()` does, where a two-digit year below 50 is in
- * the 2000s ("2/29/24" is in 2024) and any other in the 1900s. Two digits
- * followed by ":" are the hour of a time ("Feb 29 10:00 2024"), not a year.
+ * Splits a date string as V8's date parser does: into numbers, words (runs of
+ * characters from "A" up, lowercased), the symbols ":", "-", "+", "." and ")",
+ * and separators (text in parentheses, or any other character).
  */
-function toFullYear(year: string): number {
-  const value = Number(year);
-  if (year.length !== 2) {
-    return value;
+function tokenizeDate(value: string): DateToken[] {
+  const tokens: DateToken[] = [];
+  let index = 0;
+  while (index < value.length) {
+    const start = index;
+    const char = value[index];
+    if (isDigit(char)) {
+      while (isDigit(value[index])) {
+        index++;
+      }
+      tokens.push({
+        type: 'number',
+        value: Number(value.slice(start, index)),
+        length: index - start,
+      });
+    } else if (':-+.)'.includes(char)) {
+      index++;
+      tokens.push({ type: 'symbol', value: char });
+    } else if (isWordChar(char)) {
+      while (isWordChar(value[index])) {
+        index++;
+      }
+      tokens.push({
+        type: 'word',
+        value: value.slice(start, index).toLowerCase(),
+      });
+    } else if (char === '(') {
+      let depth = 0;
+      do {
+        if (value[index] === '(') {
+          depth++;
+        } else if (value[index] === ')') {
+          depth--;
+        }
+        index++;
+      } while (depth > 0 && index < value.length);
+      tokens.push({ type: 'separator' });
+    } else {
+      index++;
+      tokens.push({ type: 'separator' });
+    }
   }
-  return value < 50 ? 2000 + value : 1900 + value;
+  return tokens;
+}
+
+/**
+ * Reads the year, month and day of a date string the way `new Date()` does in
+ * V8, before it rolls a day past the end of its month into the next month.
+ * Returns `undefined` when the string has no date part to check.
+ *
+ * As in V8, an ISO date ("2024-02-30", "+002024-02-30T10:00:00Z") is read
+ * first. The rest of the string, or a string that isn't one, is read as
+ * a legacy date: a month name may stand anywhere ("Feb 30 2024", "30 Feb
+ * 2024", "2024 Feb 30"), and a number is a part of the date unless it is part
+ * of a time ("10:00:00.123") or of a UTC offset ("GMT+0300"). Missing parts
+ * are 1, then the parts are ordered by whether the first one can be a day.
+ *
+ * @see https://github.com/v8/v8/blob/main/src/date/dateparser-inl.h
+ */
+function readDateParts(
+  value: string,
+): [year: number, month: number, day: number] | undefined {
+  const tokens = tokenizeDate(value);
+  let position = 0;
+  const skipSymbol = (symbol: string) => {
+    const isNext = isSymbol(tokens[position], symbol);
+    if (isNext) {
+      position++;
+    }
+    return isNext;
+  };
+  const readFixedLengthNumber = (length: number) => {
+    const token = tokens[position];
+    return token?.type === 'number' && token.length === length
+      ? token.value
+      : undefined;
+  };
+
+  const parts: number[] = [];
+  let namedMonth: number | undefined;
+
+  // "[+-yyyyyy|yyyy][-MM[-DD]]", then the end or a time after "T". Where the
+  // string stops matching, the rest is read as a legacy date
+  const readIsoDate = (): boolean => {
+    const sign = tokens[position];
+    if (isSymbol(sign, '+') || isSymbol(sign, '-')) {
+      // Without a year after it, the sign is ignored
+      position++;
+      const year = readFixedLengthNumber(6);
+      if (year === undefined) {
+        return false;
+      }
+      position++;
+      // "-000000" isn't a year, and is skipped
+      if (sign.value === '-' && year === 0) {
+        return false;
+      }
+      parts.push(sign.value === '-' ? -year : year);
+    } else {
+      const year = readFixedLengthNumber(4);
+      if (year === undefined) {
+        return false;
+      }
+      parts.push(year);
+      position++;
+    }
+    if (skipSymbol('-')) {
+      const month = readFixedLengthNumber(2);
+      if (month === undefined || month < 1 || month > 12) {
+        return false;
+      }
+      parts.push(month);
+      position++;
+      if (skipSymbol('-')) {
+        const day = readFixedLengthNumber(2);
+        if (day === undefined || !isDay(day)) {
+          return false;
+        }
+        parts.push(day);
+        position++;
+      }
+    }
+    const next = tokens[position];
+    // An ISO date is either read whole, with the time after "T", or invalid
+    return next === undefined || (next.type === 'word' && next.value === 't');
+  };
+  const isIsoDate = readIsoDate();
+
+  let hasReadNumber = parts.length > 0;
+  // The parts of a time read so far: hours, minutes, seconds, milliseconds
+  let timeParts = 0;
+  let offsetHours: number | undefined;
+  let offsetMinutes: number | undefined;
+  const isTimeExpecting = (value: number) =>
+    timeParts === 1 || timeParts === 2
+      ? value <= 59
+      : timeParts === 3 && value <= 999;
+
+  while (!isIsoDate && position < tokens.length) {
+    const token = tokens[position++];
+    if (token.type === 'number') {
+      hasReadNumber = true;
+      if (skipSymbol(':')) {
+        // "10:00", or "10::" for 10:00
+        timeParts += skipSymbol(':') ? 2 : 1;
+        skipSymbol('.');
+      } else if (skipSymbol('.') && isTimeExpecting(token.value)) {
+        // "10:00:00.123", whose milliseconds end the time
+        position++;
+        timeParts = 4;
+      } else if (
+        offsetHours !== undefined &&
+        offsetMinutes === undefined &&
+        token.value <= 59
+      ) {
+        // The minutes of "+03:00"
+        offsetMinutes = token.value;
+      } else if (isTimeExpecting(token.value)) {
+        // The number after the last ":" of a time ends it
+        timeParts = 4;
+      } else {
+        if (parts.length === 3) {
+          return undefined;
+        }
+        parts.push(token.value);
+        skipSymbol('-');
+      }
+    } else if (token.type === 'word') {
+      const month = MONTH_NAMES.indexOf(token.value.slice(0, 3)) + 1;
+      if (month > 0) {
+        namedMonth = month;
+        skipSymbol('-');
+      } else if (
+        hasReadNumber &&
+        Object.hasOwn(TIME_ZONE_OFFSETS, token.value)
+      ) {
+        offsetHours = Math.abs(TIME_ZONE_OFFSETS[token.value]);
+        offsetMinutes = 0;
+      }
+    } else if (
+      (isSymbol(token, '+') || isSymbol(token, '-')) &&
+      ((offsetHours === 0 && offsetMinutes === 0) || timeParts > 0)
+    ) {
+      // A UTC offset after a time or "GMT": "+3", "+03", "+0300" or "+03:00"
+      const offset = tokens[position];
+      const hours = offset?.type === 'number' ? offset.value : 0;
+      const length = offset?.type === 'number' ? offset.length : 0;
+      if (offset?.type === 'number') {
+        position++;
+      }
+      hasReadNumber = true;
+      if (isSymbol(tokens[position], ':')) {
+        offsetHours = hours;
+        offsetMinutes = undefined;
+      } else if (length <= 2) {
+        offsetHours = hours;
+        offsetMinutes = 0;
+      } else {
+        offsetHours = Math.floor(hours / 100);
+        offsetMinutes = hours % 100;
+      }
+    }
+  }
+
+  if (parts.length === 0) {
+    return undefined;
+  }
+  while (parts.length < 3) {
+    parts.push(1);
+  }
+  let [year, month, day] = parts;
+  if (namedMonth !== undefined) {
+    // "Feb 30 2024" and "30 Feb 2024", or "2024 Feb 30"
+    month = namedMonth;
+    [day, year] = isDay(parts[0]) ? parts : [parts[1], parts[0]];
+  } else if (!isIsoDate && isDay(parts[0])) {
+    // "02/30/2024", unless the first number can't be a day ("2024 02 30")
+    [month, day, year] = parts;
+  }
+  // A year below 100 outside an ISO date is in the 2000s up to 49 ("2/29/24")
+  if (!isIsoDate && year >= 0 && year <= 99) {
+    year += year <= 49 ? 2000 : 1900;
+  }
+  return [year, month, day];
 }
 
 /**
@@ -144,68 +381,14 @@ export class ParseDatePipe implements PipeTransform {
    * the length of their month.
    */
   protected hasDayPastMonthEnd(value: string): boolean {
-    let year: number;
-    let month: number;
-    let day: number;
-
-    const isoMatch = YEAR_FIRST_DATE_PATTERN.exec(value);
-    if (isoMatch) {
-      year = Number(isoMatch[1]);
-      month = Number(isoMatch[2]);
-      day = Number(isoMatch[3]);
-    } else {
-      const usMatch = MONTH_FIRST_DATE_PATTERN.exec(value);
-      if (usMatch) {
-        month = Number(usMatch[1]);
-        day = Number(usMatch[2]);
-        year = toFullYear(usMatch[3]);
-      } else {
-        const namedMatch = this.matchNamedMonthDate(value);
-        if (!namedMatch) {
-          return false;
-        }
-        [year, month, day] = namedMatch;
-      }
-    }
-
-    // `new Date()` doesn't read a number above 31 as a day ("99-Jan-20" is
-    // January 20, 1999), so such a reading is left to it
-    if (day > 31) {
+    const parts = readDateParts(value);
+    if (!parts) {
       return false;
     }
+    const [year, month, day] = parts;
     const isLeapYear = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
     const daysInMonth =
       month === 2 && isLeapYear ? 29 : DAYS_IN_MONTH[month - 1];
     return daysInMonth !== undefined && day > daysInMonth;
-  }
-
-  /**
-   * Reads the year, month and day of a date whose month is a name ("Feb 30,
-   * 2024", "30 Feb 2024", "2024-Feb-30"), optionally after a weekday ("Thu,
-   * 30 Feb 2024 10:00:00 GMT"). The year may be missing ("Feb 30") as long as
-   * no digit follows the day, so that a time in between ("Feb 29 10:00 2024")
-   * is left to `new Date()`. As in `new Date()`, a month is named by its first
-   * three letters and a date without a year is in 2001.
-   */
-  private matchNamedMonthDate(
-    value: string,
-  ): [year: number, month: number, day: number] | undefined {
-    for (const pattern of NAMED_MONTH_DATE_PATTERNS) {
-      const groups = pattern.exec(value)?.groups;
-      if (!groups) {
-        continue;
-      }
-      const month =
-        MONTH_NAMES.indexOf(groups.month.slice(0, 3).toLowerCase()) + 1;
-      if (month > 0) {
-        // As in `new Date()`, a date without a year is in 2001
-        return [
-          groups.year === undefined ? 2001 : toFullYear(groups.year),
-          month,
-          Number(groups.day),
-        ];
-      }
-    }
-    return undefined;
   }
 }

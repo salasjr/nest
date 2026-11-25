@@ -256,6 +256,53 @@ describe('ParseDatePipe', () => {
           expect(target.transform(value)).toEqual(new Date(value));
         }
       });
+
+      it('should throw for a day past its month end wherever new Date() reads the parts of the date', () => {
+        for (const value of [
+          // A weekday before a year and a month name
+          'Thu, 2023 Feb 29',
+          'Fri 2024 Apr 31',
+          // A time before the date or between its parts
+          '10:00 02/29/2023',
+          '10:00 Feb 29 2023',
+          'Feb 29 10:00 2023',
+          '29 Feb 10:00:00.123 2023',
+          // The year between the month and the day, or the month last
+          'Feb 2023 29',
+          '29 2023 Feb',
+          '2023 29 Feb',
+          // Text in parentheses, and a UTC offset with minutes
+          '(due) Feb 29 2023',
+          'Feb 29 2023 10:00 GMT+03:30',
+          // A numeric date without a year, which is in 2001
+          '2/30',
+          '4/31',
+          '2/29',
+        ]) {
+          expect(() => target.transform(value)).toThrow(BadRequestException);
+        }
+      });
+
+      it('should accept the last day of each month wherever new Date() reads the parts of the date', () => {
+        for (const value of [
+          'Thu, 2024 Feb 29',
+          'Tue 2024 Apr 30',
+          '10:00 02/29/2024',
+          '10:00 Feb 29 2024',
+          'Feb 28 10:00 2023',
+          '29 Feb 10:00:00.123 2024',
+          'Feb 2024 29',
+          '29 2024 Feb',
+          '2024 29 Feb',
+          '(due) Feb 29 2024',
+          'Feb 28 2023 10:00 GMT+03:30',
+          '2/28',
+          '4/30',
+          '12/31',
+        ]) {
+          expect(target.transform(value)).toEqual(new Date(value));
+        }
+      });
     });
     describe('when empty value', () => {
       it('should throw an error', () => {
